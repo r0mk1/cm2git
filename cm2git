@@ -1,0 +1,596 @@
+#!/usr/bin/env python2
+
+import sys
+import os
+import zipfile
+import xml.etree.ElementTree as et
+import subprocess
+import shlex
+import re
+import argparse
+import errno
+
+
+class Name:
+    def __init__(self, str):
+        self.name, self.version, self.cvtype, self.instance = self.__parse(str)
+
+    def objectname(self):
+        return "%s-%s:%s:%s" % (self.name, self.version, self.cvtype, self.instance)
+
+    def fullname(self):
+        return "%s/%s/%s/%s" % (self.instance, self.cvtype, self.name, self.version)
+
+    def __parse(self, s):
+        if ':' in s:            # 4-part object name
+            t = s.split(':')
+            d = t[0].rsplit('-', 1)
+            return d[0], d[1], t[1], t[2]
+
+        # full name
+        n = s.split('/')
+        return n[2], n[3], n[1], n[0]
+
+    def __str__(self):
+        return self.fullname()
+
+    def __eq__(self, other):
+        if other is None:
+            return False
+        return self.fullname() == other.fullname()
+
+    def __hash__(self):
+        return hash(self.fullname())
+
+    def same(self, other):
+        """
+        Checks whether it is the same object but probably different version
+        """
+        return \
+            self.name == other.name and \
+            self.instance == other.instance and \
+            self.cvtype == other.cvtype
+
+
+class Project:
+    def __init__(self, name, directory):
+        self.name = name
+        zname = os.path.join(directory, self.name.objectname()+'.zip')
+        self.__zip = zipfile.ZipFile(zname)
+        self.__root = get_xml_root(self.__zip, 'export000001.xml')
+        self.__objects = read_all_exported_objects(self.__zip)
+        self.__parent = self.__build_parent_map(self.__objects)
+        self.attr = self.__read_attr()
+
+
+    def __read_attr(self):
+        pobj = self.__root.find('OBJECT')  # project is a 1st object
+        attr = {}
+        for a in pobj.findall("ATTRIBUTE"):
+            name = a.findtext('NAME')
+            value = a.findtext('VALUE')
+            if name and value:
+                attr[name] = value
+        return attr
+
+
+    def __build_parent_map(self, objects):
+        """
+        Reads all object names from the project and subprojects and
+        store them in the 'object' -> 'parent directory' dict.
+        """
+        projs = [obj for obj in objects if Name(obj.findtext('FULLNAME')).cvtype=='project']
+        ret = {}
+        for prj in projs:
+            kids = prj.findall('BINDING')
+            for k in kids:
+                ret[Name(k.findtext('CHILD/FULLNAME'))] = Name(k.findtext('PARENT/FULLNAME'))
+
+        # remove projects from the collection
+        for k,v in ret.iteritems():
+            if v.cvtype == 'project':
+                if v in ret:
+                    ret[k] = ret[v] # bind root dir of a sub-project
+                else:
+                    ret[k] = None   # clean a root project
+        for p in projs:
+            pname = Name(p.findtext('FULLNAME'))
+            if pname in ret:
+                ret.pop(pname, None)
+
+        return ret
+
+
+    def get_path(self, obj):
+        """
+        Builds path basing on object's parent folder. If no info
+        about parent folder then try to find a successors' folder.
+        TODO: more correct solution would be to search for the
+              predcessor's folders but it requires to parse parent
+              projects.
+        """
+        def build_path_rec(pmap, obj):
+            if obj == None:
+                return []
+            successors = [obj]
+            cnt = 0
+            while successors and cnt<20:
+                name = successors.pop(0)
+                if name in pmap:
+                    path = build_path_rec(pmap, pmap[name])
+                    if path is None:
+                        return None
+                    path.append(name)
+                    return path
+                successors.extend(ccm_get_successors(name))
+                cnt = cnt + 1
+            return None
+
+        path = build_path_rec(self.__parent, obj)
+        if path is None:
+            return None
+        return os.path.join(*[p.name for p in path])
+
+
+    def get_files(self):
+        return [obj for obj in self.__parent.iterkeys() if obj.cvtype not in ['dir', 'project']]
+
+
+    def get_content(self, obj):
+        if obj in self.__parent:
+            nodes_array = [n for n in self.__objects if n.findtext('FULLNAME')==obj.fullname()]
+            if nodes_array:
+                assert len(nodes_array) == 1, "Project %s should have a single '%s' object" % \
+                    (self.name.fullname(), obj.fullname())
+                node = nodes_array[0]
+                if obj.cvtype == 'symlink':
+                    return node.findtext('ATTRIBUTE/VALUE')
+                else:
+                    path = node.findtext('ATTRIBUTE/FILE/PATH')
+                    with self.__zip.open(path) as zf:
+                        return zf.read()
+        # get the content from the ccm if it's missed in the export
+        if obj.cvtype == 'symlink':
+            return ccm_attribute(obj, 'source')
+        else:
+            return ccm_cat(obj)
+
+
+    def contains(self, obj):
+        """
+        Check whether project contains any version of the object.
+        Used to filter out baseline tasks with changes for different
+        projects.
+        """
+        return any([n.same(obj) for n in self.__parent.iterkeys()])
+
+
+def execute(cmd):
+    args = shlex.split(cmd)
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    assert len(stderr)==0, "'%s' failed. stderr = '%s'" % (cmd, stderr)
+    return stdout
+
+
+def execute_split(cmd):
+    return [Name(line) for line in execute(cmd).splitlines()]
+
+
+def get_user_info(uid):
+    """
+    Returns a user info (name and email) for the 'uid' parameter.
+    """
+    return {'name':uid, 'email':None}
+
+
+def get_xml_root(zip_arc, xml_name):
+    with zip_arc.open(xml_name) as index:
+        tree = et.parse(index)
+        return tree.getroot()
+
+
+def read_all_exported_objects(zipfile):
+    objects = []
+    exports = [fname for fname in zipfile.namelist() if fname.startswith('export')]
+    for xmlname in exports:
+        objects.extend(get_xml_root(zipfile, xmlname).findall('OBJECT'))
+    return objects
+
+
+def ccm_attribute(obj, attr_name):
+    stdout = execute("ccm attr -show %s %s" % (attr_name, obj.objectname()))
+    if stdout[-1] == '\n':
+        stdout = stdout[:-1]
+    return stdout
+
+
+def ccm_cat(obj):
+    return execute("ccm cat '%s'" % obj.objectname())
+
+
+def ccm_get_predcessors(obj):
+    return execute_split("""ccm query -u -f %%objectname "has_successor('%s')" """ % obj.objectname())
+
+
+def ccm_get_successors(obj):
+    return execute_split("""ccm query -u -f %%fullname "is_successor_of('%s')" """ % obj.objectname())
+
+
+def ccm_is_baseline_project_of(proj):
+    p = execute_split("""ccm query -u -f %%objectname "is_baseline_project_of('%s')" """ % proj.objectname())
+    return p[0] if p and len(p)>0 else None
+
+
+def ccm_get_baselines(proj):
+    return execute_split("""ccm query -u -f %%objectname "has_project_in_baseline('%s')" """ % proj.objectname())
+
+
+def ccm_baseline_tasks(bsl):
+    return execute_split("""ccm query -u -f %%objectname "baseline_tasks('%s')" """ % bsl.objectname())
+
+
+def ccm_diff(obj1, obj2):
+    lines = execute("ccm diff '%s' '%s'" % (obj1.objectname(), obj2.objectname())).splitlines()
+    removed = [f[2:] for f in lines if f.startswith('< ')]
+    added = [f[2:] for f in lines if f.startswith('> ')]
+    return (removed, added)
+
+
+def get_parent_proj(proj):
+    bsl_proj = ccm_is_baseline_project_of(proj)
+    if bsl_proj:
+        return bsl_proj
+    p = ccm_get_predcessors(proj)
+    return p[0] if p and len(p)>0 else None
+
+
+def get_release(obj):
+    return ccm_attribute(obj, 'release')
+
+
+def get_baseline(proj):
+    baselines = ccm_get_baselines(proj)
+    if len(baselines) == 1:
+        return baselines[0]
+
+    release = get_release(proj)
+    for b in baselines:
+        if release == get_release(b):
+            return b
+
+    raise RuntimeError("Can't choose a baseline for the '%s'" % proj.objectname())
+
+
+def get_tasks(proj):
+    bsl = get_baseline(proj)
+    return ccm_baseline_tasks(bsl) if bsl else []
+
+
+def get_project_tasks(proj):
+    t1 = get_tasks(proj)
+    parent = get_parent_proj(proj)
+    if parent:
+        t2 = get_tasks(parent)
+        return list(set(t1) - set(t2))
+    return t1
+
+
+def test_zip_file(fname):
+    with zipfile.ZipFile(fname, "r") as zf:
+        return zf.testzip()
+
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+def create_dir(path, obj):
+    if path is None:            # store everything to the current dir
+        return ''
+    if path == '':              # use object name as dir name by default
+        path = obj.objectname()
+    mkdir_p(path)
+    return path
+
+
+def open_output_file(fname, directory, proj):
+    if fname is None:
+        return sys.stdout
+    if fname == '':
+        fname = proj.objectname() + '.out'
+    return open(os.path.join(directory, fname), 'w')
+
+
+def load_object(directory, obj):
+    """
+    Run 'ccm export' for the object.  Repeat the command in case of error
+    or broken archive since it often fails during parallel downloads.
+    """
+    name = obj.objectname()
+    zipf = os.path.join(directory, name+'.zip')
+
+    if obj.cvtype == 'project':
+        cmd = 'ccm export -r -to %s -p %s' % (zipf, name)
+    else:
+        cmd = 'ccm export -to %s %s' % (zipf, name)
+
+    ntimes = 3
+    while ntimes > 0:
+        ntimes -= 1
+        try:
+            execute(cmd)
+        except:
+            print >> sys.stderr, "Failed to execute '%s'.  Retrying." % cmd
+        else:
+            if test_zip_file(zipf) is None:
+                return
+
+    raise RuntimeError("Failed to load '%s'" % name)
+
+
+def get_dir_removed_names(dir_name):
+    deleted = []
+    for parent in ccm_get_predcessors(dir_name):
+        (r, a) = ccm_diff(parent, dir_name)
+        # ccm diff can return the same name in both removed and added
+        deleted.extend(set(r) - set(a))
+
+    # diff doesn't return objects' version, so return names only
+    return [f.split('/')[-1] for f in deleted]
+
+
+def update_progress(proj, sio):
+    print >> sio, "progress %s" % proj.objectname()
+    print >> sio, ""
+
+
+def create_commit_message(task):
+    msg = task['task_synopsis']
+    if 'task_description' in task:
+        msg += '\n\n' + task['task_description']
+    msg += 'Task: %s#%s' % (task['local_to'], task['task_number'])
+    return msg
+
+
+def write_modified_objects(task, prj, sio):
+    # find objects to delete looking through the modified 'dir' objects
+    dirs = [d for d in task['associated_cv'] if d.cvtype == 'dir']
+    # sdirs = [d for d in sorted([dd for dd in dirs])]
+    # assert dirs == sdirs, "%s is not properly ordered as %s" % (str(dirs), str(sdirs))
+    deleted = []
+    for d in dirs:
+        if d.version == '1':
+            continue
+        dpath = prj.get_path(d)
+        if not dpath:
+            print >> sys.stderr, "Can't build path for '%s'. Ignoring." % d.fullname()
+            continue
+        deleted = get_dir_removed_names(d)
+        for r in deleted:
+            path = os.path.join(dpath, r)
+            print >> sio, "D %s" % path
+
+    modified = [f for f in task['associated_cv'] if f.cvtype not in ['dir','project']]
+    for f in modified:
+        write_object(f, prj, sio)
+
+
+def get_mode(obj):
+    if obj.cvtype == 'symlink':
+        return '120000'
+    elif obj.cvtype in ['shsrc', 'executable']:
+        return '100755'
+    return '100644'
+
+
+def write_object(f, project, sio):
+    path = project.get_path(f)
+    if not path:
+        print >> sys.stderr, "Can't build path for '%s'. Ignoring." % f.fullname()
+        return
+    print >> sio, "M %s inline %s" % (get_mode(f), path)
+    c = project.get_content(f)
+    print >> sio, "data %s" % len(c)
+    print >> sio, c
+
+
+def read_task_info(taskname, directory):
+    zfile = os.path.join(directory, taskname.objectname()+'.zip')
+    with zipfile.ZipFile(zfile) as arc:
+        root = get_xml_root(arc, 'export000001.xml')
+
+        task = {}
+        for attr in root.findall("OBJECT/ATTRIBUTE"):
+            task[attr.findtext('NAME')] = attr.findtext('VALUE')
+
+        relations = root.findall("OBJECT/RELATION_FROM")
+        task['associated_cv'] = [Name(r.findtext('FULLNAME')) for r in relations if \
+                                 r.findtext('NAME') == 'associated_cv']
+        return task
+
+
+def create_baseline_commit_message(project):
+    label = "%s-%s" % (project.name.name, project.name.version)
+    msg = label
+    if 'comment' in project.attr:
+        msg += "\n\n%s" % project.attr['comment']
+    note = """The commit is used to bring the project version in sync
+with a CM baseline to catch missed files."""
+    msg += "\n\nNote: %s" % note
+    return msg
+
+
+def write_baseline_commit(project, sio, first_commit, branch, update):
+    """
+    Delete everything and recreate the whole tree with a project information
+    """
+    print >> sio, "commit refs/heads/%s" % branch
+
+    user = get_user_info(project.attr['owner'])
+    print >> sio, "committer %s <%s> %s +0100" % \
+        (user['name'], user['email'], project.attr['create_time'])
+
+    msg = create_baseline_commit_message(project).encode('utf-8')
+    print >> sio, "data %d" % len(msg)
+    print >> sio, msg
+
+    if first_commit and update is not None:
+        commit = update if update != '' else 'refs/heads/%s^0' % branch
+        print >> sio, "from %s" % commit
+
+    print >> sio, "deleteall"
+    for f in project.get_files():
+        write_object(f, project, sio)
+
+    print >> sio, "tag %s-%s" % (project.name.name, project.name.version)
+    print >> sio, "from refs/heads/%s" % branch
+    print >> sio, "tagger %s <%s> %s +0100" % \
+        (user['name'], user['email'], project.attr['create_time'])
+    print >> sio, "data 0"
+
+
+def write_commit_from_task(task, prj, sio, first_commit, branch, update):
+    print >> sio, "commit refs/heads/%s" % branch
+    print >> sio, "mark :%s" % task['task_number']
+    user = get_user_info(task['resolver'])
+    print >> sio, "committer %s <%s> %s +0100" % \
+        (user['name'], user['email'], task['completion_date'])
+    msg = create_commit_message(task).encode('utf-8')
+    print >> sio, "data %d" % len(msg)
+    print >> sio, msg
+    if first_commit and update is not None:
+        commit = update if update != '' else 'refs/heads/%s^0' % branch
+        print >> sio, "from %s" % commit
+    write_modified_objects(task, prj, sio)
+    print >> sio, ""
+
+
+def write_project_commits(proj, branch, update, directory, sio):
+    update_progress(proj, sio)
+
+    first_commit = True         # add "from refs/heads/branch^0" only for the 1st commit
+    if not branch:
+        branch = 'master'
+    prj = Project(proj, directory)
+    task_names = get_project_tasks(proj)
+    tasks = [read_task_info(tn, directory) for tn in task_names]
+    for task in sorted(tasks, key=lambda t: t['completion_date'] if 'completion_date' in t else t['create_time']):
+        print >> sys.stderr, "Processing task '%s'" % task['task_number']
+        # filter out tasks whose objects are not part of the project
+        if any([prj.contains(obj) for obj in task['associated_cv']]):
+            write_commit_from_task(task, prj, sio, first_commit, branch, update)
+            first_commit = False
+
+    write_baseline_commit(prj, sio, first_commit, branch, update)
+    print >> sio, ""
+
+
+def show(args):
+    prj = Name(args.project_spec)
+    if args.parents:
+        while prj:
+            print prj.objectname()
+            prj = get_parent_proj(prj)
+    elif args.baselines:
+        for b in ccm_get_baselines(prj):
+            print b.objectname()
+    elif args.tasks:
+        for task in get_project_tasks(prj):
+            print task.objectname()
+
+
+def load(args):
+    obj = Name(args.object_spec)
+    d = create_dir(args.directory, obj)
+    if obj.cvtype=='project' and args.tasks:
+        for task in get_project_tasks(obj):
+            load_object(d, task)
+    else:
+        load_object(d, obj)
+
+
+def write_git(args):
+    prj = Name(args.project_spec)
+    d = create_dir(args.directory, prj)
+    with open_output_file(args.output, d, prj) as out:
+        write_project_commits(prj, args.branch, args.update, d, out)
+
+
+def export(args):
+    proj = Name(args.project_spec)
+    d = create_dir(args.directory, proj)
+    load_object(d, proj)
+    tasks = get_project_tasks(proj)
+    for task in tasks:
+        load_object(d, task)
+    with open_output_file(args.output, d, proj) as out:
+        write_project_commits(proj, args.branch, args.update, d, out)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Exports synergy baseline project to the git-fast-import format.')
+    subparsers = parser.add_subparsers()
+
+    parser_show = subparsers.add_parser('show',
+                                        description='shows project attributes')
+    group = parser_show.add_mutually_exclusive_group()
+    group.add_argument('-p', '--parents', action='store_true',
+                       help='list parent projects')
+    group.add_argument('-t', '--tasks', action='store_true',
+                       help='list baseline tasks')
+    group.add_argument('-b', '--baselines', action='store_true',
+                       help='print baseline')
+    parser_show.add_argument('project_spec',
+                             help='Project specification (name-version:project:instance)')
+    parser_show.set_defaults(func=show)
+
+    parser_load = subparsers.add_parser('load',
+                                        description='loads project or tasks into .zip archive')
+    parser_load.add_argument('-t', '--tasks', action='store_true',
+                             help='load project tasks instead of a project itself')
+    parser_load.add_argument('-d', '--directory', nargs='?', default=None, const='',
+                             help='store loaded files into the directory (project name by default)')
+    parser_load.add_argument('object_spec',
+                             help='Project or task specification')
+    parser_load.set_defaults(func=load)
+
+    parser_write = subparsers.add_parser('write',
+                                         description='creates git-fast-import file from the loaded project and tasks archives')
+    parser_write.add_argument('-b', '--branch',
+                              help='A git branch name to import to')
+    parser_write.add_argument('-u', '--update', nargs='?', default=None, const='',
+                              help='Set on which commit to base export when updating')
+    parser_write.add_argument('-d', '--directory', nargs='?', default=None, const='',
+                              help='looks for downloaded files in the directory (project name by default)')
+    parser_write.add_argument('-o', '--output', nargs='?', default=None, const='',
+                              help='store the generated git-fast-import file to the specified file name')
+    parser_write.add_argument('project_spec',
+                               help='Project specification (name-version:project:instance)')
+    parser_write.set_defaults(func=write_git)
+
+    parser_export = subparsers.add_parser('export',
+                                          description='exports the whole project into the git-fast-import file')
+    parser_export.add_argument('-b', '--branch',
+                              help='A git branch name to import to')
+    parser_export.add_argument('-u', '--update', nargs='?', default=None, const='',
+                              help='Set on which commit to base export when updating')
+    parser_export.add_argument('-d', '--directory', nargs='?', default=None, const='',
+                               help='store loaded files into the directory (project name by default)')
+    parser_export.add_argument('-o', '--output', nargs='?', default=None, const='',
+                               help='store the generated git-fast-import file to the specified file name')
+    parser_export.add_argument('project_spec',
+                               help='Project specification (name-version:project:instance)')
+    parser_export.set_defaults(func=export)
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    args.func(args)
