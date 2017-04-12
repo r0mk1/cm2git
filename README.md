@@ -46,6 +46,12 @@ would produce an output like:
     ---
     > db#1/ascii/hello.txt
 
+Otherwise close all Synergy sessions and put the line
+
+    ccm.cli.tools.compare.dir.unix=diff %file1 %file2 > %outfile
+
+to the file "~/.ccm.user.properties".
+
 
 Usage examples
 --------------
