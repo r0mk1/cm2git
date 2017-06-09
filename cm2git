@@ -300,8 +300,13 @@ def get_project_tasks(proj):
 
 
 def test_zip_file(fname):
-    with zipfile.ZipFile(fname, "r") as zf:
-        return zf.testzip()
+    try:
+        with zipfile.ZipFile(fname, "r") as zf:
+            return zf.testzip()
+    except:
+        return fname
+
+    return None
 
 
 def mkdir_p(path):
@@ -349,10 +354,12 @@ def load_object(directory, obj):
         try:
             execute(cmd)
         except:
-            print >> sys.stderr, "Failed to execute '%s'.  Retrying." % cmd
+            print >> sys.stderr, "Failed to execute '%s'.  Retrying %d." % (cmd, ntimes)
         else:
             if test_zip_file(zipf) is None:
                 return
+            else:
+                print >> sys.stderr, "Bad archive '%s'.  Retrying %d." % (zipf, ntimes)
 
     raise RuntimeError("Failed to load '%s'" % name)
 
@@ -504,7 +511,6 @@ def write_project_commits(proj, branch, update, directory, sio):
     task_names = get_project_tasks(proj)
     tasks = [read_task_info(tn, directory) for tn in task_names]
     for task in sorted(tasks, key=lambda t: t['completion_date'] if 'completion_date' in t else t['create_time']):
-        print >> sys.stderr, "Processing task '%s'" % task['task_number']
         # filter out tasks whose objects are not part of the project
         if any([prj.contains(obj) for obj in task['associated_cv']]):
             write_commit_from_task(task, prj, sio, first_commit, branch, update)
